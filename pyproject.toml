@@ -111,4 +111,5 @@ verl = [
   "trainer/config/*.yaml",
   "trainer/config/*/*.yaml",
   "experimental/*/config/*.yaml",
+  "experimental/weave/global_scheduler/LICENSE",
 ]
