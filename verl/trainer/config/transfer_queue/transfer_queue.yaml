@@ -1,6 +1,10 @@
 # Whether to enable TransferQueue
 enable: False
 
+# Optional suffix used to isolate train/validation partitions between jobs that
+# share one TransferQueue controller.
+partition_id: null
+
 # Metrics configuration for TransferQueue
 metrics:
 

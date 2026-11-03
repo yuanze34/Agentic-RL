@@ -132,6 +132,9 @@ class PPOTrainer(ABC):
 
         self.trainer_mode = self.config.trainer.v1.trainer_mode
         self.parameter_sync_step = self.config.trainer.v1.get(self.trainer_mode, {}).get("parameter_sync_step", 1)
+        partition_suffix = self.config.transfer_queue.get("partition_id")
+        self.train_partition_id = f"train_{partition_suffix}" if partition_suffix else "train"
+        self.val_partition_id = f"val_{partition_suffix}" if partition_suffix else "val"
         self.replay_buffer = self._build_replay_buffer()
         self._rollout_moe_lb_metrics_accumulator = RolloutMoELoadBalanceMetricsAccumulator(
             model_config=self.config.actor_rollout_ref.model
@@ -153,7 +156,7 @@ class PPOTrainer(ABC):
         if has_custom_sampler:
             sampler_cls = load_extern_type(custom_sampler.path, custom_sampler.name)
         else:
-            sampler_cls = ReplayBuffer if self.trainer_mode == "sync" else ReplayBufferAsync
+            sampler_cls = ReplayBuffer if self.trainer_mode in ("sync", "weave_sync") else ReplayBufferAsync
 
         replay_buffer_kwargs = dict(
             trainer_mode=self.trainer_mode,
@@ -290,13 +293,7 @@ class PPOTrainer(ABC):
         for resource_pool, class_dict in self.resource_pool_to_cls.items():
             if not class_dict:
                 continue
-            worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
-            wg_dict = RayWorkerGroup(
-                resource_pool=resource_pool,
-                ray_cls_with_init=worker_dict_cls,
-                **wg_kwargs,
-            )
-            spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
+            spawn_wg = self._create_worker_groups(resource_pool, class_dict, wg_kwargs)
             all_wg.update(spawn_wg)
             logger.info(f"create worker group {spawn_wg.keys()}")
 
@@ -348,13 +345,13 @@ class PPOTrainer(ABC):
             self.distillation_config = None
 
         # 9. initialize agent loop manager
-        self.llm_server_manager: LLMServerManager = LLMServerManager.create(
-            config=self.config, worker_group=self.actor_rollout_wg, rollout_resource_pool=actor_rollout_resource_pool
+        rollout_name_suffix = str(self.config.actor_rollout_ref.rollout.get("name_suffix", "")).removeprefix("_")
+        self.llm_server_manager: LLMServerManager = self._create_llm_server_manager(
+            actor_rollout_resource_pool, rollout_name_suffix
         )
 
         # 10. initialize checkpoint engine manager
-        checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
-        checkpoint_engine_config.backend = "naive"
+        checkpoint_engine_config = self._get_initial_checkpoint_engine_config()
         self.checkpoint_manager: CheckpointEngineManager = CheckpointEngineManager(
             config=checkpoint_engine_config,
             actor_wg=self.actor_rollout_wg,
@@ -367,6 +364,24 @@ class PPOTrainer(ABC):
         self._load_checkpoint()
 
         logger.info("all initialize finished, ready to fit")
+
+    def _create_worker_groups(self, resource_pool, class_dict, wg_kwargs):
+        worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
+        wg_dict = RayWorkerGroup(resource_pool=resource_pool, ray_cls_with_init=worker_dict_cls, **wg_kwargs)
+        return wg_dict.spawn(prefix_set=class_dict.keys())
+
+    def _create_llm_server_manager(self, resource_pool, name_suffix):
+        return LLMServerManager.create(
+            config=self.config,
+            worker_group=self.actor_rollout_wg,
+            rollout_resource_pool=resource_pool,
+            replica_name_suffix=name_suffix,
+        )
+
+    def _get_initial_checkpoint_engine_config(self):
+        config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
+        config.backend = "naive"
+        return config
 
     def get_llm_client(self) -> LLMServerClient:
         """Get the LLM server client for rollout generation."""
@@ -519,7 +534,7 @@ class PPOTrainer(ABC):
         metrics_aggregator = MetricsAggregator()
         combined_keys: list = []
         combined_tags: list = []
-        combined_partition_id = "train"
+        combined_partition_id = self.train_partition_id
         for trigger_idx in range(self.parameter_sync_step):
             self.local_trigger_step = trigger_idx
             iter_metrics: dict = {}
@@ -540,7 +555,7 @@ class PPOTrainer(ABC):
             self.on_sample_begin()
             batch, off_policy_metrics = self.replay_buffer.sample(
                 global_steps=self.global_steps,
-                partition_id="train",
+                partition_id=self.train_partition_id,
                 batch_size=sample_batch_size,
             )
             metrics.update(off_policy_metrics)
@@ -673,7 +688,9 @@ class PPOTrainer(ABC):
         filter_groups = self.config.algorithm.get("filter_groups", None)
         dapo_enabled = bool(filter_groups is not None and filter_groups.get("enable", False))
         sync_refill_failed_groups = bool(self.config.trainer.v1.sampler.get("sync_refill_failed_groups", False))
-        requires_exact_refill = self.trainer_mode != "sync" or dapo_enabled or sync_refill_failed_groups
+        requires_exact_refill = (
+            self.trainer_mode not in ("sync", "weave_sync") or dapo_enabled or sync_refill_failed_groups
+        )
         if requires_exact_refill:
             user_gen_batch_size = self.config.data.get("gen_batch_size", None)
             if user_gen_batch_size not in (None, 1):
@@ -745,15 +762,15 @@ class PPOTrainer(ABC):
 
         role = Role.ActorRolloutRef if need_reference_policy(config) and not ref_in_actor else Role.ActorRollout
         self.role_worker_mapping[role] = ray.remote(ActorRolloutRefWorker)
-        self.mapping[role] = "global_pool"
+        global_pool_id = config.trainer.v1.get("resource_pool_name", "global_pool")
+        self.mapping[role] = global_pool_id
 
         # Add critic worker to mapping.
         if need_critic(config):
             self.role_worker_mapping[Role.Critic] = ray.remote(TrainingWorker)
-            self.mapping[Role.Critic] = "global_pool"
+            self.mapping[Role.Critic] = global_pool_id
 
         # Global resource pool is used for actor, rollout, critic, ref
-        global_pool_id = "global_pool"
         resource_pool_spec = {
             global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
         }
@@ -771,7 +788,7 @@ class PPOTrainer(ABC):
         else:
             config.reward.reward_model.nnodes = config.trainer.nnodes
             config.reward.reward_model.n_gpus_per_node = config.trainer.n_gpus_per_node
-            self.mapping[Role.RewardModel] = "global_pool"
+            self.mapping[Role.RewardModel] = global_pool_id
 
         distillation_config = config.get("distillation")
         if is_distillation_enabled(distillation_config):
@@ -838,16 +855,17 @@ class PPOTrainer(ABC):
 
         # 5. restore TransferQueue state (async modes). Re-issuing the restored in-flight prompts is
         # deferred to fit() to use the agent_loop_manager.
-        if self.trainer_mode != "sync" and _tq_supports_checkpoint():
+        if self.trainer_mode not in ("sync", "weave_sync") and _tq_supports_checkpoint():
             tq_ckpt_path = os.path.join(global_step_folder, "transfer_queue")
             if os.path.exists(tq_ckpt_path):
                 logger.info(f"Loading TransferQueue state from {tq_ckpt_path}")
                 tq.load_checkpoint(tq_ckpt_path)
 
-    def _reissue_inflight_prompts(self, partition_id: str = "train") -> int:
+    def _reissue_inflight_prompts(self, partition_id: str | None = None) -> int:
         """Restart checkpointed pending/running prompt groups from their persisted prompt data."""
-        if self.trainer_mode == "sync" or not _tq_supports_checkpoint():
+        if self.trainer_mode in ("sync", "weave_sync") or not _tq_supports_checkpoint():
             return 0
+        partition_id = partition_id or self.train_partition_id
         data = tq.kv_list(partition_id)
         if not data:
             return 0
@@ -872,6 +890,7 @@ class PPOTrainer(ABC):
 
         # Treat this as a new dispatch attempt for the resumed training step.
         tu.assign_non_tensor_data(batch, "global_steps", self.global_steps)
+        tu.assign_non_tensor_data(batch, "tq_partition_id", partition_id)
         tags = [{"is_prompt": True, "status": "pending", "global_steps": self.global_steps} for _ in inflight_uids]
         tq.kv_batch_put(keys=inflight_uids, partition_id=partition_id, tags=tags)
         self.agent_loop_manager.generate_sequences(batch)
@@ -939,7 +958,7 @@ class PPOTrainer(ABC):
         # dataloader but not yet trained into this checkpoint's weights) survive a restart:
         # finished trajectories are restored as-is, pending/running prompts are re-issued on resume.
         # Requires a TransferQueue release with checkpoint support (see _tq_supports_checkpoint).
-        if self.trainer_mode != "sync" and _tq_supports_checkpoint():
+        if self.trainer_mode not in ("sync", "weave_sync") and _tq_supports_checkpoint():
             tq.save_checkpoint(
                 os.path.join(local_global_step_folder, "transfer_queue"),
                 metadata={"global_steps": self.global_steps},
@@ -1340,22 +1359,24 @@ class PPOTrainer(ABC):
         chunks = [self._fetch_one_gen_batch() for _ in range(num_prompts // gen_batch_size)]
         batch = chunks[0] if len(chunks) == 1 else tu.concat_tensordict(chunks)
         tu.assign_non_tensor_data(batch, "global_steps", self.global_steps)
+        tu.assign_non_tensor_data(batch, "tq_partition_id", getattr(self, "train_partition_id", "train"))
         return batch
 
     def _submit_batch_to_rollout(self, batch: TensorDict) -> int:
         """Register prompts in TransferQueue and dispatch them for generation."""
+        partition_id = getattr(self, "train_partition_id", "train")
         tags = [{"is_prompt": True, "status": "pending", "global_steps": self.global_steps} for _ in range(len(batch))]
-        if self.trainer_mode != "sync":
+        if self.trainer_mode not in ("sync", "weave_sync"):
             tq.kv_batch_put(
                 keys=list(batch["uid"]),
-                partition_id="train",
+                partition_id=partition_id,
                 tags=tags,
                 # Persist prompt data for async checkpoint recovery.
                 # TODO: maybe let workers do it?
                 fields=batch.select(*[key for key in batch.keys() if not isinstance(batch.get(key), NonTensorData)]),
             )
         else:
-            tq.kv_batch_put(keys=list(batch["uid"]), partition_id="train", tags=tags)
+            tq.kv_batch_put(keys=list(batch["uid"]), partition_id=partition_id, tags=tags)
 
         self.agent_loop_manager.generate_sequences(batch)
         return len(batch)

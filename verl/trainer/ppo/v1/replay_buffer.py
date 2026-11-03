@@ -15,6 +15,7 @@ import logging
 import os
 import time
 from collections import Counter, defaultdict
+from collections.abc import Callable
 
 import numpy as np
 import transfer_queue as tq
@@ -143,6 +144,7 @@ class ReplayBuffer:
         max_inflight_gen_batches: int = 1,
         sync_refill_failed_groups: bool = False,
     ):
+        self.health_check: Callable[[], None] | None = None
         self.trainer_mode = trainer_mode
         self.trainer_config = trainer_config
         self.max_off_policy_threshold = max_off_policy_threshold
@@ -389,6 +391,8 @@ class ReplayBuffer:
         return KVBatchMeta(partition_id=partition_id, keys=keys, tags=tags)
 
     def _wait_for_next_poll(self, partition_id: str, last_debug_time: float) -> float:
+        if self.health_check is not None:
+            self.health_check()
         time.sleep(self.poll_interval)
         now = time.time()
         if now - last_debug_time > VERL_REPLAY_BUFFER_DEBUG_INTERVAL_SECONDS:

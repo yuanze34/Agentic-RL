@@ -15,8 +15,11 @@
 from .agent_loop_tq import AgentLoopManagerTQ, AgentLoopWorkerTQ
 from .trainer_base import PPOTrainer, get_trainer_cls, register_trainer
 from .trainer_colocate_async import PPOTrainerColocateAsync
+from .trainer_elastic import PPOTrainerElasticSeparate
+from .trainer_elastic_resident import PPOTrainerElasticResident
 from .trainer_separate_async import PPOTrainerSeparateAsync
 from .trainer_sync import PPOTrainerSync
+from .trainer_weave import PPOTrainerWeaveSeparate, PPOTrainerWeaveSync
 
 __all__ = [
     "PPOTrainer",
@@ -25,6 +28,10 @@ __all__ = [
     "PPOTrainerSync",
     "PPOTrainerColocateAsync",
     "PPOTrainerSeparateAsync",
+    "PPOTrainerWeaveSync",
+    "PPOTrainerWeaveSeparate",
+    "PPOTrainerElasticSeparate",
+    "PPOTrainerElasticResident",
     "AgentLoopWorkerTQ",
     "AgentLoopManagerTQ",
 ]

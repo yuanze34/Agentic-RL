@@ -99,6 +99,10 @@ class RolloutReplica(ABC):
         is_reward_model: bool = False,
         is_teacher_model: bool = False,
         name_suffix: str = "",
+        shared_placement_group: str | None = None,
+        shared_placement_group_id: str | None = None,
+        max_tenants_per_gpu: int = 1,
+        shared_bundle_offset: int = 0,
     ) -> None:
         self.replica_rank = replica_rank
         self.config: RolloutConfig = omega_conf_to_dataclass(config)
@@ -118,6 +122,10 @@ class RolloutReplica(ABC):
         self.is_reward_model = is_reward_model
         self.is_teacher_model = is_teacher_model
         self.name_suffix = f"_{name_suffix}" if name_suffix else ""
+        self.shared_placement_group = shared_placement_group
+        self.shared_placement_group_id = shared_placement_group_id
+        self.max_tenants_per_gpu = max_tenants_per_gpu
+        self.shared_bundle_offset = shared_bundle_offset
 
         self.rollout_mode: RolloutMode = None
         self.workers: list[ActorHandle] = []
@@ -196,16 +204,48 @@ class RolloutReplica(ABC):
             resource_pool_name = f"rollout_pool_teacher_{self.replica_rank}{self.name_suffix}"
         else:
             resource_pool_name = f"rollout_pool_{self.replica_rank}{self.name_suffix}"
-        resource_pool_spec = {
-            resource_pool_name: [self.gpus_per_replica_node] * self.nnodes,
-        }
-        resource_pool_manager = ResourcePoolManager(
-            resource_pool_spec=resource_pool_spec,
-            mapping=None,
-            max_colocate_count=2,
-        )
-        resource_pool_manager.create_resource_pool()
-        self.resource_pool = resource_pool_manager.resource_pool_dict[resource_pool_name]
+        if self.shared_placement_group is not None or self.shared_placement_group_id is not None:
+            if self.nnodes != 1:
+                raise ValueError("WEAVE shared rollout placement currently supports one Ray node")
+            from verl.experimental.weave.placement import SharedPoolSpec, SharedRayResourcePool
+            from verl.single_controller.ray.base import SubRayResourcePool
+
+            shared_pool = SharedRayResourcePool(
+                SharedPoolSpec(
+                    name=self.shared_placement_group,
+                    num_gpus=self.gpus_per_node,
+                    max_tenants_per_gpu=self.max_tenants_per_gpu,
+                    id_hex=self.shared_placement_group_id,
+                )
+            )
+            placement_groups = shared_pool.get_placement_groups()
+            if self.shared_bundle_offset + self.world_size > self.gpus_per_node:
+                raise ValueError(
+                    f"Rollout replica requires bundles [{self.shared_bundle_offset}, "
+                    f"{self.shared_bundle_offset + self.world_size}), but shared pool only has "
+                    f"{self.gpus_per_node}"
+                )
+            self.resource_pool = SubRayResourcePool(
+                placement_groups=placement_groups,
+                start_bundle_index=self.shared_bundle_offset,
+                subgroup_world_size=self.world_size,
+                process_on_nodes=[self.gpus_per_node],
+                use_gpu=True,
+                name_prefix=self.shared_placement_group,
+                max_colocate_count=self.max_tenants_per_gpu,
+                detached=True,
+            )
+        else:
+            resource_pool_spec = {
+                resource_pool_name: [self.gpus_per_replica_node] * self.nnodes,
+            }
+            resource_pool_manager = ResourcePoolManager(
+                resource_pool_spec=resource_pool_spec,
+                mapping=None,
+                max_colocate_count=2,
+            )
+            resource_pool_manager.create_resource_pool()
+            self.resource_pool = resource_pool_manager.resource_pool_dict[resource_pool_name]
 
         # create worker group for this rollout
         if self.is_reward_model:
@@ -236,6 +276,7 @@ class RolloutReplica(ABC):
             rollout_config=self.config,
             model_config=self.model_config,
             replica_rank=self.replica_rank,
+            **({"name_suffix": self.name_suffix} if self.config.name == "vllm" else {}),
         )
 
     @abstractmethod
@@ -262,9 +303,12 @@ class RolloutReplica(ABC):
     def rollout_worker_use_gpu(self) -> bool:
         return True
 
-    async def wake_up(self):
+    async def wake_up(self, tags: list[str] | None = None):
         """Wake up each rollout server."""
-        await asyncio.gather(*[server.wake_up.remote() for server in self.servers])
+        if tags is None:
+            await asyncio.gather(*[server.wake_up.remote() for server in self.servers])
+        else:
+            await asyncio.gather(*[server.wake_up.remote(tags=tags) for server in self.servers])
 
     async def sleep(self):
         """Sleep each rollout server."""
@@ -289,6 +333,14 @@ class RolloutReplica(ABC):
     async def resume_kv_cache(self):
         """Restore the kv_cache GPU memory after a weight sync."""
         await asyncio.gather(*[server.resume_kv_cache.remote() for server in self.servers])
+
+    async def suspend_tenant(self):
+        """Release a WEAVE tenant's rollout weights and KV cache."""
+        await asyncio.gather(*[server.suspend_tenant.remote() for server in self.servers])
+
+    async def resume_tenant(self):
+        """Restore a WEAVE tenant's rollout weights and KV cache."""
+        await asyncio.gather(*[server.resume_tenant.remote() for server in self.servers])
 
     async def start_profile(self, **kwargs):
         """Start profiling on the replica."""

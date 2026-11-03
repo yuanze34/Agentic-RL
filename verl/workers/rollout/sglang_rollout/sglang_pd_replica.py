@@ -47,6 +47,8 @@ class SGLangPDReplica(SGLangReplica):
         gpus_per_node: int = 8,
         is_reward_model: bool = False,
         is_teacher_model: bool = False,
+        name_suffix: str = "",
+        **kwargs,
     ):
         super().__init__(
             replica_rank,
@@ -55,6 +57,8 @@ class SGLangPDReplica(SGLangReplica):
             gpus_per_node,
             is_reward_model,
             is_teacher_model,
+            name_suffix,
+            **kwargs,
         )
         disagg = self.config.disaggregation
         assert disagg.enabled, "SGLangPDReplica requires rollout.disaggregation.enabled=True"

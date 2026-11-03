@@ -450,9 +450,9 @@ class CheckpointEngineManager:
         await asyncio.gather(*[r.sleep() for r in self.replicas])
 
     @auto_await
-    async def wake_up_replicas(self):
+    async def wake_up_replicas(self, tags: list[str] | None = None):
         """Resume all rollout replicas: recover kv_cache and weights device memory."""
-        await asyncio.gather(*[r.wake_up() for r in self.replicas])
+        await asyncio.gather(*[r.wake_up(tags=tags) for r in self.replicas])
 
     @auto_await
     async def abort_replicas(self):
@@ -465,25 +465,45 @@ class CheckpointEngineManager:
         await asyncio.gather(*[r.resume_generation() for r in self.replicas])
 
     @auto_await
-    async def release_kv_cache_replicas(self):
+    async def release_kv_cache_replicas(self, replicas: list[RolloutReplica] | None = None):
         """Release kv_cache of all rollout replicas before NCCL weight sync.
 
         Unlike sleep_replicas(), this only frees the kv_cache and leaves model
         weights untouched, so the NCCL transfer can write directly into the
         existing weight buffers.  Call resume_kv_cache_replicas() after sync.
         """
-        await asyncio.gather(*[r.release_kv_cache() for r in self.replicas])
+        replicas = self.replicas if replicas is None else replicas
+        await asyncio.gather(*[r.release_kv_cache() for r in replicas])
 
     @auto_await
-    async def resume_kv_cache_replicas(self):
+    async def resume_kv_cache_replicas(self, replicas: list[RolloutReplica] | None = None):
         """Restore kv_cache of all rollout replicas after NCCL weight sync.
 
         Counterpart to release_kv_cache_replicas().
         """
-        await asyncio.gather(*[r.resume_kv_cache() for r in self.replicas])
+        replicas = self.replicas if replicas is None else replicas
+        await asyncio.gather(*[r.resume_kv_cache() for r in replicas])
 
     @auto_await
-    async def update_weights(self, global_steps: int = None):
+    async def suspend_tenant_replicas(self, replicas: list[RolloutReplica] | None = None):
+        """Level-1 sleep selected WEAVE rollout tenants."""
+        replicas = self.replicas if replicas is None else replicas
+        await asyncio.gather(*[replica.suspend_tenant() for replica in replicas])
+
+    @auto_await
+    async def resume_tenant_replicas(self, replicas: list[RolloutReplica] | None = None):
+        """Restore selected WEAVE rollout tenants for generation."""
+        replicas = self.replicas if replicas is None else replicas
+        await asyncio.gather(*[replica.resume_tenant() for replica in replicas])
+
+    @auto_await
+    async def update_weights(
+        self,
+        global_steps: int = None,
+        *,
+        wake_weights_only: bool = False,
+        resume_after_update: bool = True,
+    ):
         """Update weights from actor worker group to rollout replicas.
 
         Args:
@@ -498,6 +518,9 @@ class CheckpointEngineManager:
         # 1. abort and save all unfinished requests for partial rollout
         await self.abort_replicas()
 
+        if wake_weights_only:
+            await self.wake_up_replicas(tags=["weights"])
+
         # 2. create a temporay worker group for all replicas
         workers = []
         for replica in self.replicas:
@@ -505,8 +528,12 @@ class CheckpointEngineManager:
         rollout = RayWorkerGroup(worker_handles=workers, ray_cls_with_init=RayClassWithInitArgs(cls=_worker_cls))
         actor_wg = self.actor_wg
 
-        # 3. release kv_cache before weight sync (weights stay in place)
-        await self.release_kv_cache_replicas()
+        # 3. release kv_cache before weight sync (weights stay in place).
+        # WEAVE-suspended replicas were already level-1 slept and were just
+        # woken with weights only, so sleeping them again would discard the
+        # transfer destination.
+        if not wake_weights_only:
+            await self.release_kv_cache_replicas()
 
         # 4. build process group
         self.build_process_group(rollout)
@@ -529,11 +556,12 @@ class CheckpointEngineManager:
             + rollout.execute_checkpoint_engine(["finalize"] * rollout.world_size)
         )
 
-        # 7. restore kv_cache after weight sync
-        await self.resume_kv_cache_replicas()
+        if resume_after_update:
+            # 7. restore kv_cache after weight sync
+            await self.resume_kv_cache_replicas()
 
-        # 8. resume all unfinished requests for partial rollout
-        await self.resume_generation_replicas()
+            # 8. resume all unfinished requests for partial rollout
+            await self.resume_generation_replicas()
 
         return sync_metrics
 

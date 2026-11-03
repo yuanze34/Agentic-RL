@@ -161,7 +161,10 @@ class TaskRunnerV1:
                 if tracking is not None:
                     tracking.finish(exit_code=0 if succeeded else 1)
             finally:
-                tq.close()
+                # In a multi-job Weave launch, a separate launcher-owned
+                # process manages the shared TransferQueue lifetime.
+                if not config.transfer_queue.get("external_owner", False):
+                    tq.close()
 
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)

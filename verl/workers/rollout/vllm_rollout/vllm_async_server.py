@@ -525,6 +525,10 @@ class vLLMHttpServer:
         Args:
             kv_transfer_params: vLLM KV-transfer payload for PD requests.
         """
+        if getattr(self, "_weave_draining", False):
+            return TokenOutput(
+                token_ids=[], stop_reason="aborted", extra_fields={"global_steps": self.global_steps}
+            )
         if self._disaggregation_role == "prefill" and self._pd_decode_peers and kv_transfer_params is None:
             return await self._pd_dispatch(
                 prompt_ids,
@@ -623,11 +627,21 @@ class vLLMHttpServer:
 
             # Get final response
             final_res: Optional[RequestOutput] = None
+            partial_res: Optional[RequestOutput] = None
             async for output in generator:
                 final_res = output
+                if output.outputs:
+                    partial_res = output
             assert final_res is not None
 
         extra_fields = {"global_steps": self.global_steps}
+        migration_abort = request_id in getattr(self, "_weave_migration_requests", set())
+        if migration_abort:
+            self._weave_migration_requests.discard(request_id)
+            # Some engine versions emit an empty terminal abort. Preserve the last
+            # cumulative tokens/logprobs so the destination can recompute KV.
+            if not final_res.outputs and partial_res is not None:
+                final_res = partial_res
         # Handle abort case: when the request is aborted by pause_generation(abort),
         # outputs may be empty. Return empty results with stop_reason="aborted"
         # instead of crashing with "IndexError: list index out of range".
@@ -656,7 +670,7 @@ class vLLMHttpServer:
 
         # Determine stop reason from finish_reason
         finish_reason = final_res.outputs[0].finish_reason
-        if finish_reason == "abort":
+        if finish_reason == "abort" or (migration_abort and finish_reason not in ("stop", "length")):
             stop_reason = "aborted"
         elif finish_reason in ("stop", "length"):
             stop_reason = "completed"
@@ -786,7 +800,10 @@ class vLLMHttpServer:
             # is configured (vLLM scheduler treats it as such).
             await self.engine.reset_prefix_cache(reset_connector=True)
         elif self.rollout_mode == RolloutMode.STANDALONE:
-            logger.info("skip wake_up in standalone mode")
+            if tags is None:
+                logger.info("skip wake_up in standalone mode")
+            else:
+                await self.engine.wake_up(tags=tags)
 
     async def sleep(self):
         if self.node_rank != 0 or not self.config.free_cache_engine:
@@ -812,7 +829,9 @@ class vLLMHttpServer:
 
     async def release_kv_cache(self):
         """Release only kv_cache GPU memory, keeping model weights intact.
-        # TODO: support true release of kv_cache
+
+        vLLM currently has no KV-only sleep primitive. Preserve the no-op
+        behavior expected by the generic checkpoint synchronization path.
         """
         if self.node_rank != 0 or not self.config.free_cache_engine:
             return
@@ -821,6 +840,34 @@ class vLLMHttpServer:
         """Restore kv_cache GPU memory after a weight sync. Counterpart to release_kv_cache()."""
         if self.node_rank != 0:
             return
+
+    async def suspend_tenant(self):
+        """WEAVE tenant suspension: offload weights and discard KV cache."""
+        if self.node_rank != 0 or not self.config.free_cache_engine:
+            return
+        await self.engine.sleep(level=1, mode="wait")
+        await self.engine.reset_encoder_cache()
+
+    async def resume_tenant(self):
+        """Restore weights and KV cache when WEAVE admits this rollout worker."""
+        if self.node_rank != 0:
+            return
+        await self.engine.wake_up(tags=["weights", "kv_cache"])
+        self._weave_draining = False
+        await self.engine.resume_generation()
+        await self.engine.reset_prefix_cache(reset_connector=True)
+
+    async def migrate_requests(self, request_ids: list[str]) -> None:
+        """Stop a WEAVE source; callers resume cumulative outputs elsewhere."""
+        self._weave_draining = True
+        if not hasattr(self, "_weave_migration_requests"):
+            self._weave_migration_requests = set()
+        for request_id in request_ids:
+            self._weave_migration_requests.add(request_id)
+            # AsyncLLM translates external IDs to its internal request IDs and
+            # emits cumulative abort outputs. Direct request_states lookups
+            # miss active requests on vLLM versions that randomize internal IDs.
+            await self.engine.abort(request_id)
 
     async def start_profile(self, **kwargs):
         if self.node_rank != 0:
@@ -1109,9 +1156,17 @@ class vLLMReplica(RolloutReplica):
         is_reward_model: bool = False,
         is_teacher_model: bool = False,
         name_suffix: str = "",
+        **kwargs,
     ):
         super().__init__(
-            replica_rank, config, model_config, gpus_per_node, is_reward_model, is_teacher_model, name_suffix
+            replica_rank,
+            config,
+            model_config,
+            gpus_per_node,
+            is_reward_model,
+            is_teacher_model,
+            name_suffix,
+            **kwargs,
         )
         self.server_class = ray.remote(vLLMHttpServer)
 

@@ -224,7 +224,12 @@ trainer:
   # V1 trainer mode configs
   v1:
 
-    # Trainer mode: "sync", "colocate_async", "separate_async"
+    # Name prefix for the default V1 worker placement group. Override when
+    # multiple independent trainers share a Ray namespace.
+    resource_pool_name: global_pool
+
+    # Trainer mode: "sync", "colocate_async", "separate_async",
+    # "weave_sync", "weave_separate", "elastic_separate", or "elastic_resident_separate"
     trainer_mode: sync
 
     # Synchronous PPO trainer
@@ -244,6 +249,56 @@ trainer:
 
       # Frequency of parameter synchronization between trainer and rollout
       parameter_sync_step: 4
+
+    # OSDI'26 WEAVE-compatible external phase scheduler.
+    # The scheduler owns every admission decision; these values only describe
+    # this job's placement in the original WEAVE Redis protocol.
+    weave:
+      host: 127.0.0.1
+      port: 9969
+      job_name: job0
+      gen_device_affinity: NVIDIA H20
+      train_device_affinity: NVIDIA H800
+      gen_gpu_list: [0]
+      train_gpu_list: [0]
+      gpus_per_gen_worker: 1
+      gen_placement_group: weave_gen_pool
+      train_placement_group: weave_train_pool
+      gen_placement_group_id: null
+      train_placement_group_id: null
+      # Global planner may place each replica in a different shared slot.
+      gen_replica_placements: []
+      train_replica_placements: []
+      train_pool_size: null
+      max_tenants_per_gpu: 2
+      poll_interval: 0.02
+      wait_timeout: null
+      init_wait_timeout: null
+      migration:
+        enabled: False
+        policy: static
+        destination_workers: [-1]
+        max_batch_size: 16
+        check_interval: 1.0
+        min_elapsed: 5.0
+        drain_timeout: 120.0
+
+    # Independent SOW task-1 safe-boundary restart protocol.
+    elastic:
+      control_dir: null
+      revision: null
+      resident:
+        enabled: false
+        train_dp: 1
+        rollout_dp: 1
+        train_slots: []
+        rollout_slots: []
+        state_transfer: disk
+        shared_slots: false
+        cost_aware: false
+        debug_memory: false
+        expand_after: null
+        resize_schedule: []
 
     # Replay buffer sampling strategy
     sampler:

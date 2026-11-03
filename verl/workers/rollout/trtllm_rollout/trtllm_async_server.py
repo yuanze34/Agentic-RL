@@ -492,11 +492,19 @@ class TRTLLMReplica(RolloutReplica):
         is_reward_model: bool = False,
         is_teacher_model: bool = False,
         name_suffix: str = "",
+        **kwargs,
     ) -> None:
         if is_teacher_model:
             raise NotImplementedError("TRTLLMReplica doesn't support teacher model yet.")
         super().__init__(
-            replica_rank, config, model_config, gpus_per_node, is_reward_model, is_teacher_model, name_suffix
+            replica_rank,
+            config,
+            model_config,
+            gpus_per_node,
+            is_reward_model,
+            is_teacher_model,
+            name_suffix,
+            **kwargs,
         )
         self.node_ip = ray.util.get_node_ip_address().strip("[]")
 

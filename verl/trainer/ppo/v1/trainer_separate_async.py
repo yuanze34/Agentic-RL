@@ -84,9 +84,7 @@ class PPOTrainerSeparateAsync(PPOTrainer):
         # initialize standalone rollout
         # TODO: make initialization parallel with super().init()
         hybrid_num_replicas = len(self.llm_server_manager.rollout_replicas)
-        self.standalone_server_manager: LLMServerManager = LLMServerManager.create(
-            config=self.config, start_rank=hybrid_num_replicas
-        )
+        self.standalone_server_manager = self._create_standalone_server_manager(hybrid_num_replicas)
 
         # create checkpoint engine manager for trainer and standalone rollout
         checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
@@ -99,6 +97,9 @@ class PPOTrainerSeparateAsync(PPOTrainer):
         # hybrid engine is in rollout mode after initialization
         self.current_mode = HybridEngineMode.ROLLOUT
         self.add_replicas_to_balancer()
+
+    def _create_standalone_server_manager(self, start_rank: int) -> LLMServerManager:
+        return LLMServerManager.create(config=self.config, start_rank=start_rank)
 
     def _compute_old_log_prob(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Version-aware old_log_probs computation for Decoupled PPO.
@@ -162,7 +163,10 @@ class PPOTrainerSeparateAsync(PPOTrainer):
         with marked_timer("update_weights", self.timing_raw, color="red"):
             # wake up all replicas to update weights; the manager returns the
             # engines' per-sync metrics (empty for backends that track none)
-            self._pending_sync_metrics = self.standalone_checkpoint_manager.update_weights(self.global_steps)
+            self._pending_sync_metrics = self._update_standalone_weights()
+
+    def _update_standalone_weights(self):
+        return self.standalone_checkpoint_manager.update_weights(self.global_steps)
 
     def _get_n_gpus_for_throughput(self) -> int:
         """Include standalone rollout GPUs in the throughput denominator.

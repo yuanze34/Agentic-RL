@@ -58,6 +58,7 @@ class ServerAdapter(BaseRollout):
         model_config: HFModelConfig,
         device_mesh: DeviceMesh,
         replica_rank: int = -1,
+        name_suffix: str = "",
     ):
         super().__init__(config, model_config, device_mesh)
         self.server_handle: ray.actor.ActorHandle = None
@@ -83,6 +84,7 @@ class ServerAdapter(BaseRollout):
             self.replica_rank = rank // rollout_world_size
         else:
             self.replica_rank = replica_rank
+        self.name_suffix = name_suffix
         self.rollout_rank = rank % rollout_world_size
         self.node_rank = self.rollout_rank // local_world_size
 
@@ -157,11 +159,11 @@ class ServerAdapter(BaseRollout):
         if self.server_handle is None:
             prefix = self._get_server_name_prefix()
             if self._pd_role == "prefill":
-                actor_name = f"{prefix}server_{self.replica_rank}_0"
+                actor_name = f"{prefix}server_{self.replica_rank}_0{self.name_suffix}"
             elif self._pd_role == "decode":
-                actor_name = f"{prefix}server_decode_{self.replica_rank}_{self._pd_server_index}"
+                actor_name = f"{prefix}server_decode_{self.replica_rank}_{self._pd_server_index}{self.name_suffix}"
             else:
-                actor_name = f"{prefix}server_{self.replica_rank}_{self.node_rank}"
+                actor_name = f"{prefix}server_{self.replica_rank}_{self.node_rank}{self.name_suffix}"
             self.server_handle = ray.get_actor(actor_name)
         return True
 

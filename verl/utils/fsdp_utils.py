@@ -176,18 +176,20 @@ def offload_fsdp_model_to_cpu(model: FSDP, empty_cache: bool = True):
     _lazy_init(model, model)
     assert model._is_root, "Only support root model offloading to CPU"
     for handle in model._all_handles:
-        if handle._offload_params:
-            continue
-        flat_param = handle.flat_param
-        assert (
-            flat_param.data.data_ptr() == flat_param._local_shard.data_ptr()
-            and id(flat_param.data) != id(flat_param._local_shard)
-            and flat_param.data.size() == flat_param._local_shard.size()
-        )
-        handle.flat_param_to(torch.device("cpu"), non_blocking=True)
-        # the following still keeps id(._local_shard) != id(.data)
-        flat_param._local_shard = flat_param.data
-        assert id(flat_param._local_shard) != id(flat_param.data)
+        if not handle._offload_params:
+            flat_param = handle.flat_param
+            assert (
+                flat_param.data.data_ptr() == flat_param._local_shard.data_ptr()
+                and id(flat_param.data) != id(flat_param._local_shard)
+                and flat_param.data.size() == flat_param._local_shard.size()
+            )
+            handle.flat_param_to(torch.device("cpu"), non_blocking=True)
+            # the following still keeps id(._local_shard) != id(.data)
+            flat_param._local_shard = flat_param.data
+            assert id(flat_param._local_shard) != id(flat_param.data)
+        if not handle.uses_sharded_strategy and not handle._use_orig_params:
+            # NO_SHARD views otherwise keep the old full CUDA storage alive.
+            handle._use_unsharded_views(as_params=False)
     if empty_cache:
         get_torch_device().empty_cache()
 

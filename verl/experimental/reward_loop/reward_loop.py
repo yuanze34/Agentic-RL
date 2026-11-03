@@ -325,6 +325,8 @@ class RewardLoopManager:
         self.reward_loop_workers = []
         num_workers = self.config.reward.num_workers
         node_ids = [node["NodeID"] for node in ray.nodes() if node["Alive"] and node["Resources"].get("CPU", 0) > 0]
+        job_name = self.config.get("trainer", {}).get("v1", {}).get("weave", {}).get("job_name")
+        actor_name_prefix = f"reward_loop_worker_{job_name}" if job_name else "reward_loop_worker"
 
         for i in range(num_workers):
             # Round-robin scheduling over the all nodes
@@ -332,7 +334,7 @@ class RewardLoopManager:
 
             self.reward_loop_workers.append(
                 self.reward_loop_workers_class.options(
-                    name=f"reward_loop_worker_{i}",
+                    name=f"{actor_name_prefix}_{i}",
                     scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                         node_id=node_id,
                         soft=True,

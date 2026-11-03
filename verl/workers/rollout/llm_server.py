@@ -236,6 +236,12 @@ class LLMServerClient:
             return request_id
         return uuid4().hex
 
+    async def _acquire_generation_server(self, request_id: str, generation_id: str):
+        return await self._acquire_server(request_id)
+
+    async def _release_generation_server(self, server_id: str, generation_id: str) -> None:
+        self._release_server(server_id)
+
     @rollout_trace_op
     async def generate(
         self,
@@ -259,7 +265,8 @@ class LLMServerClient:
         Returns:
             TokenOutput | DiffusionOutput: token or diffusion output
         """
-        server_id, server = await self._acquire_server(request_id)
+        generation_id = self._vllm_request_id(request_id)
+        server_id, server = await self._acquire_generation_server(request_id, generation_id)
         try:
             multimodal_kwargs = {}
             if audio_data is not None:
@@ -272,7 +279,7 @@ class LLMServerClient:
                 {"priority": priority} if priority != 0 and self.config.actor_rollout_ref.rollout.name == "vllm" else {}
             )
             output: TokenOutput = await server.generate.remote(
-                request_id=self._vllm_request_id(request_id),  # use new request_id for each turn
+                request_id=generation_id,
                 prompt_ids=prompt_ids,
                 sampling_params=sampling_params,
                 image_data=image_data,
@@ -286,7 +293,7 @@ class LLMServerClient:
             output.extra_fields.setdefault("max_global_steps", global_steps)
             return output
         finally:
-            self._release_server(server_id)
+            await self._release_generation_server(server_id, generation_id)
 
 
 class FullyAsyncLLMServerClient(LLMServerClient):
@@ -488,6 +495,11 @@ class LLMServerManager:
         rollout_resource_pool: RayResourcePool = None,
         start_rank: int = 0,
         load_balancer_cls: type | None = None,
+        shared_placement_group: str | None = None,
+        shared_placement_group_id: str | None = None,
+        max_tenants_per_gpu: int = 1,
+        replica_name_suffix: str = "",
+        shared_replica_placements: list[dict[str, Any]] | None = None,
     ):
         self.config = config
         self.rollout_config = config.actor_rollout_ref.rollout
@@ -496,6 +508,11 @@ class LLMServerManager:
         self.rollout_resource_pool = rollout_resource_pool
         self.start_rank = start_rank
         self._load_balancer_cls = load_balancer_cls or GlobalRequestLoadBalancer
+        self.shared_placement_group = shared_placement_group
+        self.shared_placement_group_id = shared_placement_group_id
+        self.max_tenants_per_gpu = max_tenants_per_gpu
+        self.replica_name_suffix = replica_name_suffix
+        self.shared_replica_placements = shared_replica_placements or []
 
         assert worker_group is not None or self.rollout_config.nnodes > 0, "nnodes must be > 0 in standalone mode"
 
@@ -552,13 +569,33 @@ class LLMServerManager:
             else self.rollout_config.n_gpus_per_node * self.rollout_config.nnodes
         )
         num_replicas = world_size // rollout_world_size
+        if self.shared_replica_placements and len(self.shared_replica_placements) != num_replicas:
+            raise ValueError("WEAVE needs one physical placement per rollout replica")
+
+        def shared_placement(replica_rank: int) -> dict[str, Any]:
+            if self.shared_replica_placements:
+                placement = self.shared_replica_placements[replica_rank]
+                return {
+                    "gpus_per_node": rollout_world_size,
+                    "shared_placement_group": placement["name"],
+                    "shared_placement_group_id": placement["id"],
+                    "shared_bundle_offset": 0,
+                }
+            return {
+                "gpus_per_node": self.rollout_config.n_gpus_per_node,
+                "shared_placement_group": self.shared_placement_group,
+                "shared_placement_group_id": self.shared_placement_group_id,
+                "shared_bundle_offset": replica_rank * rollout_world_size,
+            }
 
         self.rollout_replicas = [
             self.rollout_replica_class(
                 replica_rank=start_rank + replica_rank,
                 config=self.rollout_config,
                 model_config=self.model_config,
-                gpus_per_node=self.rollout_config.n_gpus_per_node,
+                max_tenants_per_gpu=self.max_tenants_per_gpu,
+                name_suffix=self.replica_name_suffix,
+                **shared_placement(replica_rank),
             )
             for replica_rank in range(num_replicas)
         ]

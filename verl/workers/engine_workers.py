@@ -641,7 +641,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.set_dispatch_collect(mesh_name="actor", **self.actor.get_dispatch_collect())
 
         # 3. build rollout engine
-        if "rollout" in self.role:
+        if self._is_rollout:
             rollout_config: RolloutConfig = omega_conf_to_dataclass(self.config.rollout)
 
             # TODO: move rollout_device_mesh into ServerAdapter
@@ -660,7 +660,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             # 3.2 initialize rollout engine
             rollout_cls: type[BaseRollout] = get_rollout_class(rollout_config.name, rollout_config.mode)
             self.rollout = rollout_cls(
-                config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh
+                config=rollout_config,
+                model_config=model_config,
+                device_mesh=rollout_device_mesh,
+                **({"name_suffix": rollout_config.name_suffix} if rollout_config.name == "vllm" else {}),
             )
 
             # used for LoRA (base_sync_done is unused in merge-only mode but kept for Phase 2 adapter path)

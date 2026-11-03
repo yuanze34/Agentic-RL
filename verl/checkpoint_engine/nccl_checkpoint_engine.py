@@ -147,6 +147,8 @@ class NCCLCheckpointEngine(CheckpointEngine):
 
     def finalize(self):
         """Destroy the NCCL process group if rebuild_group is True."""
+        if self.is_master:
+            torch.cuda.synchronize()
         if self.rebuild_group:
             if self.rank >= 0:
                 collective.destroy_collective_group(self.group_name)
@@ -156,6 +158,9 @@ class NCCLCheckpointEngine(CheckpointEngine):
         self.send_buf = None
         self.recv_buf = None
 
+        if self.is_master:
+            # Master buffers use CuPy; torch.empty_cache() cannot return their cached blocks.
+            cp.get_default_memory_pool().free_all_blocks()
         torch.cuda.empty_cache()
 
     @classmethod

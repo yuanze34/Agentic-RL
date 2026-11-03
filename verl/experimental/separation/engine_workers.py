@@ -57,6 +57,14 @@ class DetachActorWorker(ActorRolloutRefWorker):
         ActorRolloutRefWorker.__init__(self, config, role, distillation_config=distillation_config, **kwargs)
         self._strategy_handlers = None
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def init_model(self):
+        super().init_model()
+        if self._is_ref and self.ref.engine.engine_config.strategy == "fsdp":
+            from verl.utils.fsdp_utils import offload_fsdp_model_to_cpu
+
+            offload_fsdp_model_to_cpu(self.ref.engine.module)
+
     def _get_strategy_handlers(self):
         """
         Get the strategy-specific handlers for saving and restoring the model.

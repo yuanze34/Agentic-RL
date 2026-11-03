@@ -140,6 +140,7 @@ class FSDPEngine(BaseEngine):
         # set FSDP offload params
         self._is_offload_param = self.engine_config.param_offload
         self._is_offload_optimizer = self.engine_config.optimizer_offload
+        self._defer_optimizer_load = False
         self._is_lora = self.model_config.lora_rank > 0
         # Set in _build_fsdp_module when FSDP2 CPUOffloadPolicy is configured (see #5995).
         self._uses_fsdp2_cpu_offload_policy = False
@@ -785,6 +786,10 @@ class FSDPEngine(BaseEngine):
         if isinstance(grad_norm, DTensor):
             grad_norm = grad_norm.full_tensor()
 
+        defer_optimizer_load = getattr(self, "_defer_optimizer_load", False)
+        if defer_optimizer_load:
+            load_fsdp_optimizer(self.optimizer, get_device_id())
+
         if scaler is not None:
             # scaler handles inf/nan skipping internally via _check_inf_per_device.
             scaler.step(self.optimizer)
@@ -796,6 +801,9 @@ class FSDPEngine(BaseEngine):
                 self.optimizer.zero_grad()
             else:
                 self.optimizer.step()
+
+        if defer_optimizer_load:
+            offload_fsdp_optimizer(self.optimizer)
 
         if self._qat_enabled:
             from verl.utils.qat.core import invalidate_all_scales
@@ -1084,32 +1092,66 @@ class EngineEvalModeCtx(BaseEngineCtx):
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
         # unshard the root FSDP module
-        if self.engine.engine_config.fsdp_size > 1:
-            if fsdp_version(self.engine.module) == 1:
-                self.engine.module._handle.reshard(True)
-            elif fsdp_version(self.engine.module) == 2:
-                self.engine.module.reshard()
+        version = fsdp_version(self.engine.module)
+        if version == 1:
+            handle = self.engine.module._handle
+            # fsdp_size=-1 still shards across the actual DP group.
+            if handle is not None and handle.uses_sharded_strategy:
+                handle.reshard(True)
+        elif version == 2 and self.engine.engine_config.fsdp_size > 1:
+            self.engine.module.reshard()
 
         super().__exit__(exc_type, exc_value, traceback)
+        if (
+            exc_type is None
+            and not self.disable_auto_offload
+            and self.engine.engine_config.forward_only
+            and self.engine.engine_config.strategy == "fsdp"
+        ):
+            # CPUOffload restores flat storage, but NO_SHARD plain views can still own CUDA tensors.
+            offload_fsdp_model_to_cpu(self.engine.module)
 
 
 class EngineTrainModeCtx(BaseEngineCtx):
     def __init__(self, engine: FSDPEngine, **kwargs):
         super().__init__(engine=engine, mode="train", **kwargs)
+        self.defer_optimizer_load = (
+            not self.disable_auto_offload
+            and engine.is_optimizer_offload_enabled
+            and engine.engine_config.strategy == "fsdp"
+        )
+
+    def _context_switch(self, device):
+        if self.defer_optimizer_load and device != "cpu":
+            # Adam moments are not needed until optimizer_step.
+            self.engine.to(
+                device=device,
+                model=self.engine.is_param_offload_enabled,
+                optimizer=False,
+                grad=self.engine.is_param_offload_enabled,
+            )
+        else:
+            super()._context_switch(device)
 
     def __enter__(self):
         assert isinstance(self.engine, FSDPEngine)
+        self.prev_defer_optimizer_load = getattr(self.engine, "_defer_optimizer_load", False)
         super().__enter__()
+        # Nested train_batch contexts inherit the outer mini-batch staging policy.
+        self.engine._defer_optimizer_load = self.prev_defer_optimizer_load or self.defer_optimizer_load
         self.prev_sp_group = get_ulysses_sequence_parallel_group()
         set_ulysses_sequence_parallel_group(self.engine.ulysses_parallel_group)
         self.engine.module.train()
 
     def __exit__(self, exc_type, exc_value, traceback):
         assert isinstance(self.engine, FSDPEngine)
-        set_ulysses_sequence_parallel_group(self.prev_sp_group)
-        if self.zero_grad_on_exit or exc_type is not None:
-            self.engine.optimizer_zero_grad()
-        super().__exit__(exc_type, exc_value, traceback)
+        try:
+            set_ulysses_sequence_parallel_group(self.prev_sp_group)
+            if self.zero_grad_on_exit or exc_type is not None:
+                self.engine.optimizer_zero_grad()
+            super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.engine._defer_optimizer_load = self.prev_defer_optimizer_load
 
 
 @EngineRegistry.register(model_type="language_model", backend=["fsdp", "fsdp2"], device=["cuda", "npu"])

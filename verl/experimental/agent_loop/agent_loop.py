@@ -679,6 +679,7 @@ class AgentLoopWorker:
         *,
         agent_name: str,
         trace: bool = True,
+        tq_partition_id: str | None = None,
         **kwargs,
     ) -> _InternalAgentLoopOutput:
         with rollout_trace_attr(
@@ -705,7 +706,9 @@ class AgentLoopWorker:
                 tools=ToolListWrap(self.tools),
             )
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
-            return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
+            return await self._agent_loop_postprocess(
+                output, trajectory["validate"], tq_partition_id=tq_partition_id, **kwargs
+            )
 
     def _pad_token_ids(
         self,

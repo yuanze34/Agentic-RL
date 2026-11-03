@@ -45,6 +45,7 @@ class vLLMPDReplica(vLLMReplica):
         is_reward_model: bool = False,
         is_teacher_model: bool = False,
         name_suffix: str = "",
+        **kwargs,
     ):
         super().__init__(
             replica_rank,
@@ -54,6 +55,7 @@ class vLLMPDReplica(vLLMReplica):
             is_reward_model,
             is_teacher_model,
             name_suffix,
+            **kwargs,
         )
 
         disagg = self.config.disaggregation

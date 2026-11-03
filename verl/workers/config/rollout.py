@@ -156,6 +156,8 @@ class RolloutConfig(BaseConfig):
     }
 
     name: Optional[str] = MISSING
+    # Optional suffix for named rollout server actors in shared Ray namespaces.
+    name_suffix: str = ""
     mode: str = "async"
     nnodes: int = 0
     n_gpus_per_node: int = 8

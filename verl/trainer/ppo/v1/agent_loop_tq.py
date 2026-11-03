@@ -106,7 +106,8 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
 
     async def _run_prompt(self, prompt: dict, sampling_params: dict, trajectory: dict, trace: bool = False) -> None:
         """Spawn multiple agent loops in parallel according to rollout.n or rollout.val_kwargs.n."""
-        uid, partition_id = prompt["uid"], "train" if not trajectory["validate"] else "val"
+        uid = prompt["uid"]
+        partition_id = prompt.pop("tq_partition_id", "train" if not trajectory["validate"] else "val")
         await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "running"})
         tasks = []
         try:
@@ -123,7 +124,12 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             for i in range(n):
                 task = asyncio.create_task(
                     self._run_agent_loop(
-                        run_sampling_params, trajectory=trajectory, trace=trace, session_id=i, **prompt
+                        run_sampling_params,
+                        trajectory=trajectory,
+                        trace=trace,
+                        tq_partition_id=partition_id,
+                        session_id=i,
+                        **prompt,
                     )
                 )
                 tasks.append(task)
@@ -152,6 +158,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
     ) -> None:
         """Put agent loop outputs into TransferQueue."""
         uid, session_id = kwargs["uid"], kwargs["session_id"]
+        partition_id = kwargs.pop("tq_partition_id", "train" if not validate else "val")
         outputs = output if isinstance(output, list) else [output]
         if not outputs:
             logger.warning(f"Empty output for prompt {uid}_{session_id}")
@@ -223,7 +230,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             keys=keys,
             fields=list_of_dict_to_tensordict(fields),
             tags=tags,
-            partition_id="train" if not validate else "val",
+            partition_id=partition_id,
         )
 
 
