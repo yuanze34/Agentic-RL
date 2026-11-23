@@ -7,6 +7,7 @@ exclusive decision of the external WEAVE scheduler.
 from __future__ import annotations
 
 import logging
+import time
 
 from omegaconf import open_dict
 
@@ -267,7 +268,9 @@ class PPOTrainerWeaveSeparate(_WeaveTrainerMixin, PPOTrainerSeparateAsync):
         logger.info("WEAVE rollout replicas suspended after init")
 
     def _update_standalone_weights(self):
+        waiting = time.monotonic()
         self.weave_client.wait_for_weight_update()
+        started = time.monotonic()
         result = self.standalone_checkpoint_manager.update_weights(
             self.global_steps,
             wake_weights_only=True,
@@ -276,12 +279,25 @@ class PPOTrainerWeaveSeparate(_WeaveTrainerMixin, PPOTrainerSeparateAsync):
         self.standalone_checkpoint_manager.wake_up_replicas(tags=["kv_cache"])
         self.standalone_checkpoint_manager.suspend_tenant_replicas()
         self.weave_client.finish_weight_update()
+        logger.info(
+            "WEAVE transition action=update step=%d wait_seconds=%.9f elapsed_seconds=%.9f",
+            self.global_steps,
+            started - waiting,
+            time.monotonic() - started,
+        )
         return result
 
     def _weave_activate_generate(self, worker_ids: list[int]):
         replicas = self._standalone_replicas_for_workers(worker_ids)
         logger.info("WEAVE resuming rollout workers %s", worker_ids)
+        started = time.monotonic()
         self.standalone_checkpoint_manager.resume_tenant_replicas(replicas)
+        logger.info(
+            "WEAVE transition action=resume step=%d workers=%s elapsed_seconds=%.9f",
+            self.global_steps,
+            worker_ids,
+            time.monotonic() - started,
+        )
         logger.info("WEAVE resumed rollout workers %s", worker_ids)
         self._add_standalone_replicas(replicas)
         logger.info("WEAVE added rollout workers %s to the load balancer", worker_ids)
@@ -289,7 +305,14 @@ class PPOTrainerWeaveSeparate(_WeaveTrainerMixin, PPOTrainerSeparateAsync):
     def _weave_deactivate_generate(self, worker_ids: list[int]):
         replicas = self._standalone_replicas_for_workers(worker_ids)
         self._remove_standalone_replicas(replicas)
+        started = time.monotonic()
         self.standalone_checkpoint_manager.suspend_tenant_replicas(replicas)
+        logger.info(
+            "WEAVE transition action=suspend step=%d workers=%s elapsed_seconds=%.9f",
+            self.global_steps,
+            worker_ids,
+            time.monotonic() - started,
+        )
 
     def _weave_suspend_after_weight_sync(self):
         pass

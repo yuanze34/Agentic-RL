@@ -46,12 +46,17 @@ def job_command(
 ) -> list[str]:
     if not job.get("command"):
         raise ValueError(f"{job['job_name']} has no command to launch")
+    trainer_mode = job.get("trainer_mode", "weave_separate")
+    if trainer_mode not in ("weave_separate", "dual_engine_separate"):
+        raise ValueError(f"Unsupported WEAVE trainer_mode: {trainer_mode}")
+    if trainer_mode == "dual_engine_separate" and (migration or slot_width != 1):
+        raise ValueError("Dual Engine launch requires migration disabled and one GPU per slot")
     replicas = [rollout_placements[slot] for slot in job["rollout_slots"]]
     placements = _placement_override(replicas)
     name = job["job_name"]
     train_gpus_per_node = min(len(job["train"]), group.get("gpus_per_node", group["num_train_gpus"]))
     settings = {
-        "trainer.v1.trainer_mode": "weave_separate",
+        "trainer.v1.trainer_mode": trainer_mode,
         "trainer.nnodes": len(job["train"]) // train_gpus_per_node,
         "trainer.n_gpus_per_node": train_gpus_per_node,
         "trainer.val_before_train": False,
@@ -170,7 +175,11 @@ def launch(
             )
             _wait_ready(owner, lambda: "TRANSFER_QUEUE_OWNER_READY" in owner_log.read_text(), "TransferQueue owner")
             jobs = []
+            dual_slots = []
             for index, group in enumerate(plan["groups"]):
+                dual = [job.get("trainer_mode") == "dual_engine_separate" for job in group["jobs"]]
+                if any(dual) and not all(dual):
+                    raise ValueError("A task group cannot mix shared dual Engine and per-task rollout engines")
                 port = base_port + index
                 directory = output / group["group_id"]
                 directory.mkdir(exist_ok=True)
@@ -252,6 +261,11 @@ def launch(
                     name = f"weave_{token}_{index}_rollout_{slot}"
                     pool = create_detached_pool(SharedPoolSpec(name, plan["gpus_per_worker"], tenants))
                     stack.callback(remove_placement_group, pool)
+                    if all(dual):
+                        from verl.experimental.elastic.dual_engine import close_shared_slot
+
+                        stack.callback(close_shared_slot, pool.id.hex())
+                        dual_slots.append((pool.id.hex(), directory / f"dual-engine-slot-{slot}.json"))
                     rollout.append({"name": name, "id": pool.id.hex()})
                 for job in group["jobs"]:
                     command = job_command(
@@ -265,6 +279,7 @@ def launch(
                         scheduler_host=scheduler_host,
                         ray_address=ray_address,
                         run_id=token,
+                        migration=job.get("trainer_mode") != "dual_engine_separate",
                     )
                     (directory / f"{job['job_name']}.command.json").write_text(json.dumps(command, indent=2))
                     process = start(command, directory / f"{job['job_name']}.log")
@@ -288,6 +303,12 @@ def launch(
                 time.sleep(0.1)
             (output / "exit-codes.json").write_text(json.dumps(failures, sort_keys=True) + "\n")
             (output / "completion-unix.json").write_text(json.dumps(completion_unix, sort_keys=True) + "\n")
+            for placement_id, status_path in dual_slots:
+                from verl.experimental.elastic.dual_engine import NAMESPACE, slot_name
+
+                slot_owner = ray.get_actor(slot_name(placement_id), namespace=NAMESPACE)
+                status = ray.get(slot_owner.status.remote())
+                status_path.write_text(json.dumps(status, indent=2) + "\n")
         return 0
     finally:
         ray.shutdown()
